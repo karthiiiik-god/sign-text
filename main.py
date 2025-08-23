@@ -1,215 +1,241 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Body, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
-from dotenv import load_dotenv
-from typing import Dict, Any, List
-from supabase import create_client
-import requests
 import os
+import json
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Dict, List, Set
 
-load_dotenv()
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
+app = FastAPI(title="SignCall Backend", version="1.0.0")
 
-app = FastAPI(title="SignCall Backend", version="1.1.0")
-
+# CORS (dev-friendly)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten later
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=[""],  # must be "" (not empty string)
+    allow_headers=[""],  # must be "" (not empty string)
 )
 
-EMOJI_MAP = {"yes": "👍", "no": "👎", "hello": "✌"}
+# -----------------------------------------------------------------------------
+# In-memory stores (OK for demos; use a DB in production)
+# -----------------------------------------------------------------------------
+MESSAGES: Dict[str, List[dict]] = defaultdict(list)              # user_id -> [{content, emoji, timestamp}]
+CUSTOM_GESTURES: Dict[str, List[dict]] = defaultdict(list)       # user_id -> [{name, seq_json}]
+SIGNALING: Dict[str, Set[WebSocket]] = defaultdict(set)          # user_id -> websockets
+ROOM_PEERS: Dict[str, Dict[WebSocket, str]] = defaultdict(dict)  # room -> {websocket: peerId}
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+class GestureSample(BaseModel):
+    # Expecting 36 frames; each frame is 63 floats (21 landmarks * x,y,z)
+    # We accept any length to keep it flexible.
+    frames: List[List[float]]
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def send_peers_snapshot(room_code: str) -> None:
+    """Send the current peer list to everyone in the room."""
+    peers_map = ROOM_PEERS.get(room_code, {})
+    if not peers_map:
+        return
+    peer_list = list(peers_map.values())
+    payload = json.dumps({"type": "peers", "peers": peer_list})
+    # Iterate on a copy to avoid size-change during loop
+    for ws in list(peers_map.keys()):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            # Drop broken sockets
+            ROOM_PEERS[room_code].pop(ws, None)
+
+# -----------------------------------------------------------------------------
+# Health / root
+# -----------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "SignCall Backend"}
 
 @app.get("/health")
-def health():
-    return {"ok": True, "time": datetime.now().isoformat()}
+async def health():
+    return {"ok": True, "time": now_iso()}
 
-# ---------- Auth ----------
-@app.post("/signup")
-def signup(email: str, password: str):
-    if not supabase:
-        raise HTTPException(400, "Supabase not configured on server.")
-    try:
-        res = supabase.auth.sign_up({"email": email, "password": password})
-        user = res.user
-        if not user:
-            raise HTTPException(status_code=400, detail="Signup failed (no user returned)")
-        return {"user_id": user.id, "email": user.email}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Signup failed: {e}")
-
+# -----------------------------------------------------------------------------
+# Auth (demo stubs)
+# -----------------------------------------------------------------------------
 @app.post("/login")
-def login(email: str, password: str):
-    if not supabase:
-        raise HTTPException(400, "Supabase not configured on server.")
-    try:
-        res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-        user = res.user
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        return {"user_id": user.id, "email": user.email}
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Login failed: {e}")
+async def login(email: str = Query(...), password: str = Query(...)):
+    # Demo: treat the email as user_id
+    return {"user_id": email}
 
-# ---------- Messages ----------
+@app.post("/signup")
+async def signup(email: str = Query(...), password: str = Query(...)):
+    # Demo: just echo an id
+    return {"user_id": email}
+
+# -----------------------------------------------------------------------------
+# Chat & history
+# -----------------------------------------------------------------------------
 @app.post("/message")
-def save_message(user_id: str, content: str, emoji: str = "", language: str = "en"):
-    if not supabase:
-        # fall back: pretend saved, return echo (so front-end still works without DB)
-        key = (content or "").strip().lower()
-        emoji = emoji or EMOJI_MAP.get(key, "")
-        return {"status": "ok_no_db", "data": {
-            "user_id": user_id, "content": content, "emoji": emoji,
-            "language": language, "timestamp": datetime.now().isoformat()
-        }}
-    try:
-        key = (content or "").strip().lower()
-        if not emoji and key in EMOJI_MAP:
-            emoji = EMOJI_MAP[key]
-        data = {
-            "user_id": user_id,
-            "content": content,
-            "emoji": emoji,
-            "language": language,
-            "timestamp": datetime.now().isoformat(),
-        }
-        supabase.table("messages").insert(data).execute()
-        return {"status": "saved", "data": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
+async def post_message(
+    user_id: str = Query(...),
+    content: str = Query(""),
+    emoji: str = Query(""),
+    language: str = Query("en"),
+):
+    MESSAGES[user_id].append(
+        {"content": content, "emoji": emoji, "language": language, "timestamp": now_iso()}
+    )
+    return {"ok": True}
 
 @app.get("/history/{user_id}")
-def get_history(user_id: str):
-    if not supabase:
-        return []  # no DB -> just return empty history
-    try:
-        res = (
-            supabase.table("messages")
-            .select("*")
-            .eq("user_id", user_id)
-            .order("timestamp", desc=False)
-            .execute()
-        )
-        return res.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB fetch failed: {e}")
+async def get_history(user_id: str):
+    return JSONResponse(MESSAGES.get(user_id, []))
 
 @app.delete("/history/{user_id}")
-def clear_history(user_id: str):
-    if not supabase:
-        return {"status": "ok_no_db"}
-    try:
-        supabase.table("messages").delete().eq("user_id", user_id).execute()
-        return {"status": "cleared"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB delete failed: {e}")
+async def clear_history(user_id: str):
+    MESSAGES[user_id].clear()
+    return {"ok": True}
 
-# ---------- Translate ----------
+# -----------------------------------------------------------------------------
+# Translation (demo stub)
+# -----------------------------------------------------------------------------
 @app.get("/translate")
-def translate(text: str, lang: str):
-    try:
-        url = f"https://api.mymemory.translated.net/get?q={requests.utils.quote(text)}&langpair=en|{lang}"
-        res = requests.get(url, timeout=10).json()
-        out = res.get("responseData", {}).get("translatedText", "")
-        return {"translated": out}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Translate failed: {e}")
+async def translate(text: str = Query(""), lang: str = Query("en")):
+    # Stub: just echo text
+    return {"translated": text}
 
-# ---------- Personal dictionary (optional; safe if no DB) ----------
-@app.post("/custom_gesture/save")
-def custom_gesture_save(user_id: str, name: str, sample_idx: int, seq_json: Dict[str, Any] = Body(...)):
-    if not supabase:
-        return {"ok": True, "note": "no DB configured"}
-    try:
-        if not isinstance(seq_json, dict) or "frames" not in seq_json:
-            raise HTTPException(status_code=400, detail="seq_json must contain 'frames'")
-        supabase.table("custom_gestures").insert({
-            "user_id": user_id,
-            "name": name,
-            "sample_idx": sample_idx,
-            "seq_json": seq_json,
-        }).execute()
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"save_custom_gesture failed: {e}")
-
-@app.get("/custom_gesture/list")
-def custom_gesture_list(user_id: str):
-    if not supabase:
-        return []
-    try:
-        res = supabase.table("custom_gestures").select("name,sample_idx").eq("user_id", user_id).execute()
-        counts: Dict[str, int] = {}
-        for row in (res.data or []):
-            counts[row["name"]] = counts.get(row["name"], 0) + 1
-        return [{"name": k, "samples": v} for k, v in counts.items()]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"list_custom_gestures failed: {e}")
-
+# -----------------------------------------------------------------------------
+# Custom gestures
+# -----------------------------------------------------------------------------
 @app.get("/custom_gesture/samples")
-def custom_gesture_samples(user_id: str, name: str = ""):
-    if not supabase:
-        return []
-    try:
-        q = supabase.table("custom_gestures").select("name,seq_json").eq("user_id", user_id)
-        if name:
-            q = q.eq("name", name)
-        res = q.execute()
-        return res.data or []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"custom_gesture_samples failed: {e}")
+async def list_gesture_samples(user_id: str = Query(...)):
+    return JSONResponse(CUSTOM_GESTURES.get(user_id, []))
 
-# ---------- WebSocket rooms ----------
-class Room:
-    def __init__(self):
-        self.clients: List[WebSocket] = []
-        self.peer_ids: Dict[WebSocket, str] = {}
+@app.post("/custom_gesture/save")
+async def save_gesture_sample(
+    user_id: str = Query(...),
+    name: str = Query(...),
+    sample_idx: int = Query(0),
+    body: GestureSample = Body(...),
+):
+    # Store raw sequence to keep things flexible; client can decide shape
+    CUSTOM_GESTURES[user_id].append({"name": name, "seq_json": body.dict()})
+    return {"ok": True, "count": len(CUSTOM_GESTURES[user_id])}
 
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.clients.append(ws)
-
-    def disconnect(self, ws: WebSocket):
-        if ws in self.clients:
-            self.clients.remove(ws)
-        self.peer_ids.pop(ws, None)
-
-    async def set_peer(self, ws: WebSocket, peer_id: str):
-        self.peer_ids[ws] = peer_id
-        await self.broadcast_state()
-
-    async def broadcast_state(self):
-        peers = [pid for pid in self.peer_ids.values() if pid]
-        msg = {"type": "peers", "peers": peers}
-        for cli in list(self.clients):
-            try:
-                await cli.send_json(msg)
-            except Exception:
-                pass
-
-ROOMS: Dict[str, Room] = {}
-
-@app.websocket("/ws/room/{room_code}")
-async def ws_room(websocket: WebSocket, room_code: str):
-    room = ROOMS.setdefault(room_code, Room())
-    await room.connect(websocket)
+# -----------------------------------------------------------------------------
+# WebSocket: signaling (rings & accept/reject)
+# -----------------------------------------------------------------------------
+@app.websocket("/ws/signaling")
+async def ws_signaling(ws: WebSocket):
+    await ws.accept()
+    user_id = None
     try:
         while True:
-            data = await websocket.receive_json()
-            if data.get("type") == "hello":
-                await room.set_peer(websocket, data.get("peerId") or "")
-    except WebSocketDisconnect:
-        room.disconnect(websocket)
-        await room.broadcast_state()
-    except Exception:
-        room.disconnect(websocket)
-        await room.broadcast_state()
+            data = await ws.receive_text()
+            msg = json.loads(data)
 
+            # Initial hello
+            if msg.get("type") == "presence_hello":
+                user_id = msg.get("userId") or "anon"
+                SIGNALING[user_id].add(ws)
+                continue
+
+            # Caller -> ring
+            if msg.get("type") == "ring":
+                to = msg.get("to")
+                payload = {
+                    "type": "incoming_call",
+                    "from": msg.get("from"),
+                    "room": msg.get("room"),
+                }
+                for peer_ws in list(SIGNALING.get(to, set())):
+                    try:
+                        await peer_ws.send_text(json.dumps(payload))
+                    except Exception:
+                        SIGNALING[to].discard(peer_ws)
+                continue
+
+            # Callee -> accept / reject
+            if msg.get("type") in ("call_accept", "call_reject"):
+                to = msg.get("to")  # original caller
+                event = "call_accepted" if msg["type"] == "call_accept" else "call_rejected"
+                payload = {
+                    "type": event,
+                    "from": msg.get("from"),
+                    "room": msg.get("room"),
+                }
+                for peer_ws in list(SIGNALING.get(to, set())):
+                    try:
+                        await peer_ws.send_text(json.dumps(payload))
+                    except Exception:
+                        SIGNALING[to].discard(peer_ws)
+                continue
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if user_id and ws in SIGNALING.get(user_id, set()):
+            SIGNALING[user_id].discard(ws)
+
+# -----------------------------------------------------------------------------
+# WebSocket: room discovery (PeerJS IDs list)
+# -----------------------------------------------------------------------------
+@app.websocket("/ws/room/{room_code}")
+async def ws_room(ws: WebSocket, room_code: str):
+    await ws.accept()
+    try:
+        # Expect first message: {"type":"hello", "peerId": "...", "userId": "..."}
+        hello_raw = await ws.receive_text()
+        hello_msg = json.loads(hello_raw)
+        if hello_msg.get("type") != "hello" or not hello_msg.get("peerId"):
+            await ws.close(code=4000)
+            return
+    except Exception:
+        await ws.close(code=4000)
+        return
+
+    peer_id = hello_msg["peerId"]
+    ROOM_PEERS[room_code][ws] = peer_id
+
+    # Broadcast full peer list to everyone (this also informs the joiner)
+    await send_peers_snapshot(room_code)
+
+    try:
+        while True:
+            # Keep-alive; ignore arbitrary text from clients
+            _ = await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # Remove from room and broadcast updated list
+        ROOM_PEERS[room_code].pop(ws, None)
+        if ROOM_PEERS.get(room_code):
+            await send_peers_snapshot(room_code)
+        else:
+            ROOM_PEERS.pop(room_code, None)
+
+# -----------------------------------------------------------------------------
+# Local dev runner
+# -----------------------------------------------------------------------------
+if __name__ == "_main_":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8003")),
+        reload=True,
+    )
