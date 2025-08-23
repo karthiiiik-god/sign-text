@@ -16,16 +16,16 @@ if not BACKEND:
     try:
         BACKEND = st.secrets["BACKEND_URL"]
     except Exception:
-        BACKEND = "http://127.0.0.1:8003"  # change if needed
+        BACKEND = "http://127.0.0.1:8003"  # adjust if your backend runs elsewhere
 
 DEFAULT_USER = "demo_user"
 EMOJI_MAP = {"Yes": "👍", "No": "👎", "Hello": "✌"}
 
 # Read ?room= from URL if present
 try:
-    qp = st.query_params  # Streamlit >= 1.30
+    qp = st.query_params            # Streamlit >= 1.30
 except Exception:
-    qp = st.experimental_get_query_params()  # fallback
+    qp = st.experimental_get_query_params()  # Streamlit < 1.30
 
 query_room = None
 if isinstance(qp, dict):
@@ -251,14 +251,8 @@ with col1:
   let ws = null;      // room socket
   let sigWS = null;   // signaling socket
 
-  // pid -> {{ call, data, videoEl, capEl, transEl }}
+  // Map of peerId -> {{ call, data, videoEl, capEl, transEl }}
   const peers = {{}};
-
-  // ===== Custom gesture lib data =====
-  let GESTURE_LIB = [];
-  let WIN = [];
-  let customOn = false;
-  let cooldownUntil = 0;
 
   function setStatus(t) {{ statusEl.textContent = "Status: " + t; }}
 
@@ -295,20 +289,26 @@ with col1:
     }} catch(e){{}}
   }}
 
-  function ensureRemoteSlot(pid) {{
-    if (peers[pid] && peers[pid].videoEl) return peers[pid];
-    const card = document.createElement('div');
+  function ensureRemoteCard(pid) {{
+    let card = document.querySelector('[data-peer=\"' + pid + '\"]');
+    if (card) return {{
+      videoEl: card.querySelector('video'),
+      capEl: card.querySelector('[data-cap]'),
+      transEl: card.querySelector('[data-trans]')
+    }};
+    card = document.createElement('div');
     card.className = 'card';
+    card.setAttribute('data-peer', pid);
     card.innerHTML = '<div><b>' + pid + '</b></div>'
                    + '<video autoplay playsinline></video>'
                    + '<div class="caption" data-cap></div>'
                    + '<div class="caption small" data-trans></div>';
     remotesDiv.appendChild(card);
-    const videoEl = card.querySelector('video');
-    const capEl   = card.querySelector('[data-cap]');
-    const transEl = card.querySelector('[data-trans]');
-    peers[pid] = Object.assign(peers[pid] || {{}}, {{ videoEl, capEl, transEl }});
-    return peers[pid];
+    return {{
+      videoEl: card.querySelector('video'),
+      capEl: card.querySelector('[data-cap]'),
+      transEl: card.querySelector('[data-trans]')
+    }};
   }}
 
   function broadcastCaption(text, emoji="") {{
@@ -321,53 +321,53 @@ with col1:
 
   function handleIncomingData(fromPid, msg) {{
     if (!msg || msg.type !== "caption") return;
-    const p = ensureRemoteSlot(fromPid);
+    const slot = ensureRemoteCard(fromPid);
     const line = (msg.text || "") + (msg.emoji ? " " + msg.emoji : "");
-    p.capEl.innerText = line;
+    slot.capEl.innerText = line;
     (async () => {{
       const ta = await translate(msg.text || "", "ta");
       const hi = await translate(msg.text || "", "hi");
-      p.transEl.innerHTML = 'TA: ' + ta + '<br/>HI: ' + hi;
+      slot.transEl.innerHTML = 'TA: ' + ta + '<br/>HI: ' + hi;
     }})();
     speak(msg.text || "");
   }}
 
-  // ===== PeerJS (add public TURN for reliability) =====
+  // ---- PeerJS setup with TURN (reliable through NAT/firewalls) ----
   async function initPeer() {{
     return new Promise((resolve) => {{
       const peerOpts = {{
-        host: 'peerjs.com',
-        secure: true,
+        host: "0.peerjs.com",
         port: 443,
+        path: "/",
+        secure: true,
         config: {{
           iceServers: [
-            {{ urls: 'stun:stun.l.google.com:19302' }},
-            {{ urls: 'turn:openrelay.metered.ca:80',   username: 'openrelayproject', credential: 'openrelayproject' }},
-            {{ urls: 'turn:openrelay.metered.ca:443',  username: 'openrelayproject', credential: 'openrelayproject' }},
-            {{ urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }},
-            {{ urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }}
+            {{ urls: "stun:stun.l.google.com:19302" }},
+            {{ urls: "turn:openrelay.metered.ca:80",  username: "openrelayproject", credential: "openrelayproject" }},
+            {{ urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" }},
+            {{ urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }}
           ]
         }}
       }};
-      peer = new Peer(null, peerOpts);
+      peer = new Peer(undefined, peerOpts);
 
       peer.on('open', (id) => {{
         myPeerId = id;
         setStatus("Peer ready (id: " + id + ") Room: " + ROOMCODE);
 
-        // incoming media
+        // Incoming media calls
         peer.on('call', (incomingCall) => {{
-          incomingCall.answer(localStream);
+          if (localStream) incomingCall.answer(localStream);
           incomingCall.on('stream', (remote) => {{
             const pid = incomingCall.peer;
-            const slot = ensureRemoteSlot(pid);
+            const slot = ensureRemoteCard(pid);
             slot.videoEl.srcObject = remote;
           }});
           const pid = incomingCall.peer;
           peers[pid] = Object.assign(peers[pid] || {{}}, {{ call: incomingCall }});
         }});
 
-        // incoming data
+        // Incoming data connections
         peer.on('connection', (conn) => {{
           const pid = conn.peer;
           peers[pid] = Object.assign(peers[pid] || {{}}, {{ data: conn }});
@@ -375,17 +375,18 @@ with col1:
         }});
 
         openSignaling();
+        joinRoomWS();
         resolve(peer);
+      }});
+
+      peer.on('error', (err) => {{
+        console.error('PeerJS error:', err);
+        setStatus('Peer error: ' + (err && err.type ? err.type : 'unknown'));
       }});
     }});
   }}
 
-  async function ensurePeerAndSignaling() {{
-    if (!peer) await initPeer();
-    if (!sigWS || sigWS.readyState !== 1) openSignaling();
-  }}
-
-  // ===== WS: room discovery =====
+  // ---- WS: room discovery ----
   function joinRoomWS() {{
     if (ws) try {{ ws.close(); }} catch (e) {{}}
     ws = new WebSocket(wsRoomURL(ROOMCODE));
@@ -398,32 +399,28 @@ with col1:
         m.peers.forEach(pid => {{
           if (!pid || pid === myPeerId) return;
           if (peers[pid] && (peers[pid].call || peers[pid].data)) return;
-          if (!localStream) {{
-            setStatus("Starting camera to connect…");
-            startCamera().then(() => connectToPeer(pid));
-          }} else {{
-            connectToPeer(pid);
-          }}
+
+          // Outgoing media call
+          const outCall = peer.call(pid, localStream);
+          outCall.on('stream', (remote) => {{
+            const slot = ensureRemoteCard(pid);
+            slot.videoEl.srcObject = remote;
+          }});
+
+          // Outgoing data connection
+          const dconn = peer.connect(pid);
+          dconn.on('data', (msg) => handleIncomingData(pid, msg));
+
+          peers[pid] = Object.assign(peers[pid] || {{}}, {{ call: outCall, data: dconn }});
         }});
       }}
     }};
     ws.onclose = () => setStatus("Room socket closed (" + ROOMCODE + ")");
   }}
 
-  function connectToPeer(pid) {{
-    const outCall = peer.call(pid, localStream);
-    outCall.on('stream', (remote) => {{
-      const slot = ensureRemoteSlot(pid);
-      slot.videoEl.srcObject = remote;
-    }});
-    const dconn = peer.connect(pid);
-    dconn.on('data', (msg) => handleIncomingData(pid, msg));
-    peers[pid] = Object.assign(peers[pid] || {{}}, {{ call: outCall, data: dconn }});
-  }}
-
-  // ===== WS: signaling/presence =====
+  // ---- WS: signaling/presence (ring/accept/reject) ----
   function openSignaling() {{
-    if (sigWS && sigWS.readyState === 1) return;
+    if (sigWS) return;
     sigWS = new WebSocket(wsSignalingURL());
     sigWS.onopen = () => {{
       sigWS.send(JSON.stringify({{ type:'presence_hello', userId: USER_ID }}));
@@ -466,27 +463,19 @@ with col1:
       alert('Enter target user_id');
       return;
     }}
-    ensurePeerAndSignaling();
     const room = 'sign-' + Math.random().toString(36).slice(2,8);
-    if (sigWS && sigWS.readyState === 1) {{
-      sigWS.send(JSON.stringify({{
-        type:'ring', from: USER_ID, to: targetUid, room
-      }}));
-      setStatus("Ringing " + targetUid + " … (room " + room + ")");
-    }} else {{
-      setStatus("Signaling not ready; trying again…");
-      setTimeout(() => callUser(targetUid), 500);
-    }}
+    sigWS && sigWS.send(JSON.stringify({{
+      type:'ring', from: USER_ID, to: targetUid, room
+    }}));
+    setStatus("Ringing " + targetUid + " … (room " + room + ")");
   }}
 
-  // ===== Buttons / helpers =====
+  // ---- Buttons / helpers ----
   async function startCamera() {{
-    if (!peer) await initPeer();
     localStream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: true }});
     localVideo.srcObject = localStream;
+    if (!peer) await initPeer();
     setStatus("Camera ON");
-    // auto-join current room if any
-    joinRoomWS();
   }}
 
   document.getElementById('startCam').onclick = async () => {{
@@ -507,7 +496,7 @@ with col1:
     setStatus("Camera OFF");
   }};
 
-  // ===== Web Speech (STT) =====
+  // ---- Web Speech (STT) ----
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   let recog = null;
   document.getElementById('startMic').onclick = () => {{
@@ -531,7 +520,12 @@ with col1:
     setStatus("STT OFF");
   }};
 
-  // ===== Custom gesture library loading & UI =====
+  // ====== Custom gesture library ======
+  let GESTURE_LIB = [];
+  let WIN = [];
+  let customOn = false;
+  let cooldownUntil = 0;
+
   function renderGestureChips() {{
     customList.innerHTML = "";
     if (!GESTURE_LIB.length) {{
@@ -582,7 +576,7 @@ with col1:
       for (const row of rows) {{
         const name = row.name || "custom";
         const seq = (row.seq_json && row.seq_json.frames) || [];
-        const frames = seq.map(fr => Float32Array.from(fr)); // 36 x 63
+        const frames = seq.map(fr => Float32Array.from(fr));
         const v = meanVec(frames);
         lib.push({{ name, vecs: [v] }});
       }}
@@ -604,7 +598,7 @@ with col1:
 
   document.getElementById('refreshLib').onclick = () => loadGestureLibrary();
 
-  // ===== Mediapipe Hands (quick + custom) =====
+  // ---- Mediapipe Hands (quick + custom) ----
   let camera = null;
   const videoGhost = document.createElement('video');
   const hands = new Hands({{ locateFile: (f) => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/' + f }});
@@ -652,6 +646,7 @@ with col1:
   hands.onResults((results) => {{
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length===0) return;
 
+    // Quick hard-coded signs
     const lm = results.multiHandLandmarks[0];
     const isExt = (tip,pip)=> lm[tip].y < lm[pip].y;
     const isFold= (tip,pip)=> lm[tip].y > lm[pip].y;
@@ -669,6 +664,7 @@ with col1:
     if (thumbDown) {{ broadcastCaption("No", "👎"); return; }}
     if (vSign)     {{ broadcastCaption("Hello", "✌"); return; }}
 
+    // Sliding window for custom matching
     const pts = lm.map(p => [p.x, p.y, p.z]);
     const n = normalize(pts);
     const f63 = flatten63(n);
@@ -697,20 +693,22 @@ with col1:
     setStatus("Gestures OFF");
   }};
 
-  // ===== Invite link (avoid nullsrcdoc) =====
+  // ---- Invite link (avoid nullsrcdoc by using top/window) ----
   function buildInviteLink() {{
+    let href = "";
     try {{
-      const topHref = window.top && window.top.location && window.top.location.href;
-      if (topHref) {{
-        const u = new URL(topHref);
-        return u.origin + u.pathname + '?room=' + encodeURIComponent(ROOMCODE);
-      }}
-    }} catch (_e) {{}}
+      href = (window.top && window.top.location && window.top.location.href) ||
+             (window.parent && window.parent.location && window.parent.location.href) ||
+             window.location.href;
+    }} catch (_e) {{
+      href = window.location.href;
+    }}
     try {{
-      const u2 = new URL(document.referrer);
-      return u2.origin + u2.pathname + '?room=' + encodeURIComponent(ROOMCODE);
-    }} catch (_e2) {{}}
-    return '?room=' + encodeURIComponent(ROOMCODE);
+      const u = new URL(href);
+      return u.origin + u.pathname + '?room=' + encodeURIComponent(ROOMCODE);
+    }} catch (_e) {{
+      return '?room=' + encodeURIComponent(ROOMCODE);
+    }}
   }}
 
   document.getElementById('callBtn').onclick = () => {{
@@ -738,7 +736,9 @@ with col1:
 with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=False):
     teach_name = st.text_input("Sign name (e.g., Amma, Bus stop, OK?)", key="teach_name")
     teach_reps = st.number_input("Samples to record", 5, 20, 8, key="teach_reps")
-    st.caption("Click Start teach then perform the sign; it will capture ~1.2s windows repeatedly until the target sample count is reached.")
+    st.caption(
+        "Click Start teach then perform the sign; it will capture ~1.2s windows repeatedly until the target sample count is reached."
+    )
 
     colA, colB = st.columns([1, 1])
     start_clicked = colA.button("Start teach", use_container_width=True)
@@ -846,7 +846,7 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
     const lm = res.multiHandLandmarks[0];
     const pts = lm.map(p => [p.x, p.y, p.z]);
     const n = normalize(pts);
-    frames.push(n.flat());  // 63 floats
+    frames.push(n.flat());
 
     if (frames.length >= 36) {{
       const seq = frames.slice(0,36);
@@ -856,7 +856,7 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
       setMsg("Captured sample #" + count + " ✓", "ok");
 
       const ok = await saveSample(count, seq);
-      if (!ok) setMsg("Save failed (check backend URL / CORS)", "err");
+      if (!ok) setMsg("Save failed (check backend URL)", "err");
 
       if (count >= TARGET) {{
         setMsg("Done! You can close this section.", "ok");
@@ -887,7 +887,7 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
 </body>
 </html>
             """,
-            height=360,
+            height=380,
             scrolling=False,
         )
     elif st.session_state.get("teach_on") is False:
