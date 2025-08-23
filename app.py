@@ -127,7 +127,6 @@ st.markdown(
   video, canvas{width:320px;height:240px;background:#111418;border:1px solid #23272f;border-radius:12px}
   .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
   .chip{background:#0f172a;border:1px solid #334155;border-radius:999px;padding:4px 10px;font-size:12px}
-  /* make text inputs a bit larger for better UX (especially Teach name) */
   .stTextInput input{height:48px;font-size:18px}
 </style>
 """,
@@ -135,7 +134,7 @@ st.markdown(
 )
 
 # ===================== LAYOUT =========================
-st.title("✌ SignCall — Sign-to-Text Video Calls")
+st.title("✌️ SignCall — Sign-to-Text Video Calls")
 col1, col2 = st.columns([1.25, 1])
 
 # ===================== COL1: VIDEO CALL ===============
@@ -211,7 +210,7 @@ with col1:
   const TTS_RATE = {_tts_rate};
   const TTS_PITCH= {_tts_pitch};
 
-  // Derive websocket URL from BACKEND (no template braces to confuse Python)
+  // WebSocket URL from BACKEND
   const _bURL = new URL(BACKEND);
   const _wsScheme = (_bURL.protocol === 'https:') ? 'wss:' : 'ws:';
   const _wsHost   = _bURL.host;
@@ -245,13 +244,16 @@ with col1:
 
   async function apiSave(content, emoji="") {{
     try {{
-      await fetch(${{BACKEND}}/message?user_id=${{encodeURIComponent(USER_ID)}}&content=${{encodeURIComponent(content)}}&emoji=${{encodeURIComponent(emoji)}}&language=en, {{ method: 'POST' }});
+      await fetch(BACKEND + "/message?user_id=" + encodeURIComponent(USER_ID) +
+        "&content=" + encodeURIComponent(content) +
+        "&emoji=" + encodeURIComponent(emoji) +
+        "&language=en", {{ method: 'POST' }});
     }} catch (e) {{ console.error(e); }}
   }}
 
   async function translate(text, lang) {{
     try {{
-      const r = await fetch(${{BACKEND}}/translate?text=${{encodeURIComponent(text)}}&lang=${{lang}});
+      const r = await fetch(BACKEND + "/translate?text=" + encodeURIComponent(text) + "&lang=" + lang);
       if (!r.ok) return "";
       const j = await r.json();
       return j.translated || "";
@@ -277,10 +279,11 @@ with col1:
     if (peers[pid] && peers[pid].videoEl) return peers[pid];
     const card = document.createElement('div');
     card.className = 'card';
-    card.innerHTML = `<div><b>${{pid}}</b></div>
-                      <video autoplay playsinline></video>
-                      <div class="caption" data-cap></div>
-                      <div class="caption small" data-trans></div>`;
+    card.innerHTML = `
+      <div><b>${{pid}}</b></div>
+      <video autoplay playsinline></video>
+      <div class="caption" data-cap></div>
+      <div class="caption small" data-trans></div>`;
     remotesDiv.appendChild(card);
     const videoEl = card.querySelector('video');
     const capEl   = card.querySelector('[data-cap]');
@@ -305,7 +308,7 @@ with col1:
     (async () => {{
       const ta = await translate(msg.text || "", "ta");
       const hi = await translate(msg.text || "", "hi");
-      p.transEl.innerHTML = TA: ${{ta}}<br/>HI: ${{hi}};
+      p.transEl.innerHTML = `TA: ${{ta}}<br/>HI: ${{hi}}`;
     }})();
     speak(msg.text || "");
   }}
@@ -373,10 +376,15 @@ with col1:
 
   // ---- Buttons ----
   document.getElementById('startCam').onclick = async () => {{
-    localStream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: true }});
-    localVideo.srcObject = localStream;
-    await initPeer();
-    setStatus("Camera ON");
+    try {{
+      localStream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: true }});
+      localVideo.srcObject = localStream;
+      await initPeer();
+      setStatus("Camera ON");
+    }} catch (e) {{
+      console.error(e);
+      alert("Camera/Mic permission blocked. Allow it in browser site settings.");
+    }}
   }};
   document.getElementById('stopCam').onclick = () => {{
     Object.values(peers).forEach(p => {{
@@ -460,7 +468,7 @@ with col1:
 
   async function loadGestureLibrary() {{
     try {{
-      const url = ${{BACKEND}}/custom_gesture/samples?user_id=${{encodeURIComponent(USER_ID)}};
+      const url = BACKEND + "/custom_gesture/samples?user_id=" + encodeURIComponent(USER_ID);
       const r = await fetch(url);
       if (!r.ok) throw new Error("fetch failed");
       const rows = await r.json(); // each: {{name, seq_json}}
@@ -494,7 +502,7 @@ with col1:
   // ---- MediaPipe Hands (quick + custom) ----
   let camera = null;
   const videoGhost = document.createElement('video');
-  const hands = new Hands({{ locateFile: (f) => https://cdn.jsdelivr.net/npm/@mediapipe/hands/${{f}} }});
+  const hands = new Hands({{ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${{f}}` }});
   hands.setOptions({{
     maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7
   }});
@@ -599,7 +607,6 @@ with col1:
 
 # ===================== Teach a custom sign =====================
 with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=False):
-    # Bigger input by CSS above; keep text_input (single-line)
     teach_name = st.text_input("Sign name (e.g., Amma, Bus stop, OK?)", key="teach_name")
     teach_reps = st.number_input("Samples to record", 5, 20, 5, key="teach_reps")
     st.caption(
@@ -678,7 +685,7 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
     e.textContent = t; e.className = cls;
   }}
   function setStat(done, total) {{
-    document.getElementById('teachStat').textContent = Recording samples… ${{done}}/${{total}};
+    document.getElementById('teachStat').textContent = `Recording samples… ${{done}}/${{total}}`;
   }}
 
   function normalize(pts) {{
@@ -691,7 +698,10 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
 
   async function saveSample(sampleIdx, seqFrames) {{
     try {{
-      const r = await fetch(${{BACKEND}}/custom_gesture/save?user_id=${{encodeURIComponent(USER_ID)}}&name=${{encodeURIComponent(NAME)}}&sample_idx=${{sampleIdx}}, {{
+      const url = BACKEND + "/custom_gesture/save?user_id=" + encodeURIComponent(USER_ID)
+                + "&name=" + encodeURIComponent(NAME)
+                + "&sample_idx=" + sampleIdx;
+      const r = await fetch(url, {{
         method:"POST", headers:{{"Content-Type":"application/json"}},
         body: JSON.stringify({{ frames: seqFrames }})
       }});
@@ -699,7 +709,7 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
     }} catch(e) {{ return false; }}
   }}
 
-  const hands = new Hands({{ locateFile: f => https://cdn.jsdelivr.net/npm/@mediapipe/hands/${{f}} }});
+  const hands = new Hands({{ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${{f}}` }});
   hands.setOptions({{ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.7, minTrackingConfidence:0.7 }});
 
   hands.onResults(async (res) => {{
@@ -718,7 +728,7 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
       frames = [];
       count++;
       setStat(count, TARGET);
-      setMsg(Captured sample #${{count}} ✓, "ok");
+      setMsg(`Captured sample #${{count}} ✓`, "ok");
 
       const ok = await saveSample(count, seq);
       if (!ok) setMsg("Save failed (check backend URL)", "err");
