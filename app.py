@@ -8,7 +8,7 @@ import requests
 import streamlit as st
 
 # ===================== PAGE CONFIG =====================
-st.set_page_config(page_title="SignCall", layout="wide")
+st.set_page_config(page_title="SignCall — Sign + Dictionary", layout="wide")
 
 # ===================== BACKEND URL =====================
 BACKEND = os.getenv("BACKEND_URL")
@@ -16,27 +16,14 @@ if not BACKEND:
     try:
         BACKEND = st.secrets["BACKEND_URL"]
     except Exception:
-        BACKEND = "http://127.0.0.1:8003"  # adjust if your backend runs elsewhere
+        BACKEND = "http://127.0.0.1:8003"
 
 DEFAULT_USER = "demo_user"
 EMOJI_MAP = {"Yes": "👍", "No": "👎", "Hello": "✌"}
 
-# Read ?room= from URL if present
-try:
-    qp = st.query_params            # Streamlit >= 1.30
-except Exception:
-    qp = st.experimental_get_query_params()  # Streamlit < 1.30
-
-query_room = None
-if isinstance(qp, dict):
-    query_room = qp.get("room")
-    if isinstance(query_room, list):
-        query_room = query_room[0]
-
 # ===================== STATE ===========================
 st.session_state.setdefault("user_id", DEFAULT_USER)
 st.session_state.setdefault("last_seen_ts", "")
-st.session_state.setdefault("room_code", query_room or "sign-demo")
 st.session_state.setdefault("teach_on", False)
 
 # ===================== SIDEBAR =========================
@@ -68,7 +55,11 @@ with st.sidebar:
                         else:
                             st.error("Login response missing user id.")
                     else:
-                        st.error(r.text)
+                        try:
+                            msg = r.json().get("detail", r.text)
+                        except Exception:
+                            msg = r.text
+                        st.error(f"Login failed: {msg}")
                 except Exception as e:
                     st.error(f"Login failed: {e}")
 
@@ -98,7 +89,11 @@ with st.sidebar:
                         st.success("Account created 🎉")
                         st.session_state["user_id"] = uid or st.session_state.get("user_id", DEFAULT_USER)
                     else:
-                        st.error(r.text)
+                        try:
+                            msg = r.json().get("detail", r.text)
+                        except Exception:
+                            msg = r.text
+                        st.error(f"Signup failed: {msg}")
                 except Exception as e:
                     st.error(f"Signup failed: {e}")
 
@@ -115,13 +110,29 @@ with st.sidebar:
     user_id = st.text_input("User ID", value=st.session_state.get("user_id", DEFAULT_USER))
     st.session_state["user_id"] = user_id
 
+    st.markdown("## 🌐 Languages")
+    LANG_CHOICES = [
+        ("ta", "Tamil"), ("hi", "Hindi"), ("te", "Telugu"), ("kn", "Kannada"),
+        ("ml", "Malayalam"), ("mr", "Marathi"), ("bn", "Bengali"),
+        ("gu", "Gujarati"), ("pa", "Punjabi"), ("ur", "Urdu"),
+        ("en", "English")
+    ]
+    default_langs = ["ta", "hi"]
+    selected_langs = st.multiselect(
+        "Translate detected text to:",
+        options=[c[0] for c in LANG_CHOICES],
+        default=default_langs,
+        format_func=lambda x: dict(LANG_CHOICES)[x]
+    )
+    if "en" not in selected_langs:
+        selected_langs.append("en")
+
     st.markdown("## 🔊 Audio")
     play_ui_sounds = st.toggle("UI sounds (send/receive)", value=True)
     tts_rate = st.slider("Voice speed", 0.5, 2.0, 1.0, 0.1)
     tts_pitch = st.slider("Voice pitch", 0.0, 2.0, 1.0, 0.1)
 
     autorefresh = st.toggle("Auto-refresh chat (2s)", value=True)
-    translate_toggle = st.toggle("Show translations (TA + HI)", value=True)
 
 # ===================== STYLES ==========================
 st.markdown(
@@ -139,28 +150,26 @@ st.markdown(
   .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
   .chip{background:#0f172a;border:1px solid #334155;border-radius:999px;padding:4px 10px;font-size:12px}
   .stTextInput input{height:48px;font-size:18px}
+  .card{ background:#111418;border:1px solid #23272f;padding:10px;border-radius:12px;margin-top:8px; width:340px}
+  .caption{ font-size:16px; margin-top:6px }
+  .small{ font-size:12px; color:#94a3b8 }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 # ===================== LAYOUT =========================
-st.title("✌ SignCall — Sign-to-Text Video Calls")
-col1, col2 = st.columns([1.25, 1])
+st.title("✌ SignCall — Sign + Dictionary")
 
-# ===================== COL1: VIDEO CALL ===============
-with col1:
-    st.subheader("Video Call (Multi-user)")
-    st.session_state["room_code"] = st.text_input(
-        "Room code (share with others to join):",
-        value=st.session_state["room_code"],
-    )
+tab_live, tab_teach, tab_dict, tab_chat = st.tabs(["Live Detector", "Teach New Sign", "Sign Dictionary", "Chat"])
 
+# ===================== LIVE DETECTOR ===================
+with tab_live:
     _backend_js = json.dumps(BACKEND)
     _user_id_js = json.dumps(st.session_state["user_id"])
-    _roomcode_js = json.dumps(st.session_state["room_code"])
     _tts_rate = float(tts_rate)
     _tts_pitch = float(tts_pitch)
+    _langs_js = json.dumps(selected_langs)
 
     st.components.v1.html(
         f"""
@@ -168,55 +177,42 @@ with col1:
 <html>
 <head>
 <meta charset="utf-8"/>
-<title>SignCall Room</title>
 <style>
   body {{ background:#0b0f14; color:#e5e7eb; font-family:system-ui; }}
   .row{{ display:flex; gap:12px; margin:8px 0; flex-wrap:wrap }}
   .btn{{ padding:8px 12px; border-radius:10px; border:1px solid #334155; background:#111827; color:#e5e7eb; cursor:pointer }}
-  .card{{ background:#111418;border:1px solid #23272f;padding:10px;border-radius:12px;margin-top:8px; width:320px }}
+  .card{{ background:#111418;border:1px solid #23272f;padding:10px;border-radius:12px;margin-top:8px; width:340px }}
   video{{ width:100%; height:240px; background:#111418; border:1px solid #23272f; border-radius:12px; object-fit:cover }}
   .caption{{ font-size:16px; margin-top:6px }}
   .small{{ font-size:12px; color:#94a3b8 }}
-  #remotes{{ display:flex; flex-wrap:wrap; gap:12px }}
   .chips{{ display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 }}
   .chip{{ background:#0f172a;border:1px solid #334155;border-radius:999px;padding:4px 10px;font-size:12px }}
-  input[type="text"]{{padding:6px 8px;border-radius:8px;border:1px solid #334155;background:#0b1120;color:#e5e7eb}}
+  img.media{{ max-width:320px; border-radius:8px; border:1px solid #23272f; margin-top:6px }}
 </style>
 </head>
 <body>
   <div class="row">
     <div class="card">
-      <div><b>Local</b></div>
+      <div><b>Camera</b></div>
       <video id="localVideo" autoplay playsinline muted></video>
       <div id="localCap" class="caption small"></div>
+      <div id="localTrans" class="caption small"></div>
+      <div id="signInfo" class="caption small"></div>
     </div>
-    <div id="remotes"></div>
   </div>
 
   <div class="row">
     <button class="btn" id="startCam">📷 Start Camera</button>
     <button class="btn" id="stopCam">🛑 Stop Camera</button>
-    <button class="btn" id="startMic">🎤 Start STT</button>
-    <button class="btn" id="stopMic">🔇 Stop STT</button>
     <button class="btn" id="startGest">🖐 Start Gestures</button>
     <button class="btn" id="stopGest">✋ Stop Gestures</button>
     <button class="btn" id="refreshLib">🔄 Refresh gestures</button>
-  </div>
-
-  <div class="row">
-    <input id="calleeUid" type="text" placeholder="Target user_id to call"/>
-    <button class="btn" id="callBtn">📞 Call user</button>
-    <button class="btn" id="copyLink">🔗 Copy invite</button>
   </div>
 
   <div id="status" class="small">Status: idle</div>
   <div class="small" style="margin-top:6px">Custom gestures:</div>
   <div id="customList" class="chips"></div>
 
-  <!-- PeerJS -->
-  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
-
-  <!-- Mediapipe Hands -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
@@ -224,35 +220,23 @@ with col1:
   <script>
   const BACKEND  = {_backend_js};
   const USER_ID  = {_user_id_js};
-  let   ROOMCODE = {_roomcode_js};
   const TTS_RATE = {_tts_rate};
   const TTS_PITCH= {_tts_pitch};
-
-  // Derive WebSocket URLs from BACKEND
-  const bURL = new URL(BACKEND);
-  const wsScheme = (bURL.protocol === 'https:') ? 'wss:' : 'ws:';
-  const host = bURL.host;
-  function wsRoomURL(code) {{
-    return wsScheme + '//' + host + '/ws/room/' + encodeURIComponent(code);
-  }}
-  function wsSignalingURL() {{
-    return wsScheme + '//' + host + '/ws/signaling';
-  }}
+  const LANGS    = {_langs_js};
 
   const statusEl   = document.getElementById('status');
   const localVideo = document.getElementById('localVideo');
   const localCap   = document.getElementById('localCap');
-  const remotesDiv = document.getElementById('remotes');
+  const localTrans = document.getElementById('localTrans');
+  const signInfo   = document.getElementById('signInfo');
   const customList = document.getElementById('customList');
 
   let localStream = null;
-  let peer = null;
-  let myPeerId = null;
-  let ws = null;      // room socket
-  let sigWS = null;   // signaling socket
 
-  // Map of peerId -> {{ call, data, videoEl, capEl, transEl }}
-  const peers = {{}};
+  let GESTURE_LIB = []; // {{name, vecs}}
+  let WIN = [];
+  let customOn = false;
+  let cooldownUntil = 0;
 
   function setStatus(t) {{ statusEl.textContent = "Status: " + t; }}
 
@@ -265,13 +249,22 @@ with col1:
     }} catch (e) {{ console.error(e); }}
   }}
 
-  async function translate(text, lang) {{
+  async function tr(text, lang) {{
     try {{
       const r = await fetch(BACKEND + '/translate?text=' + encodeURIComponent(text) + '&lang=' + lang);
       if (!r.ok) return "";
       const j = await r.json();
       return j.translated || "";
     }} catch(e){{ return ""; }}
+  }}
+
+  async function fetchSign(name) {{
+    try {{
+      const r = await fetch(BACKEND + '/signs/lookup?name=' + encodeURIComponent(name));
+      if (!r.ok) return null;
+      const j = await r.json();
+      return j.sign || null;
+    }} catch(e){{ return null; }}
   }}
 
   function speak(text) {{
@@ -288,243 +281,6 @@ with col1:
       window.speechSynthesis.speak(u);
     }} catch(e){{}}
   }}
-
-  function ensureRemoteCard(pid) {{
-    let card = document.querySelector('[data-peer=\"' + pid + '\"]');
-    if (card) return {{
-      videoEl: card.querySelector('video'),
-      capEl: card.querySelector('[data-cap]'),
-      transEl: card.querySelector('[data-trans]')
-    }};
-    card = document.createElement('div');
-    card.className = 'card';
-    card.setAttribute('data-peer', pid);
-    card.innerHTML = '<div><b>' + pid + '</b></div>'
-                   + '<video autoplay playsinline></video>'
-                   + '<div class="caption" data-cap></div>'
-                   + '<div class="caption small" data-trans></div>';
-    remotesDiv.appendChild(card);
-    return {{
-      videoEl: card.querySelector('video'),
-      capEl: card.querySelector('[data-cap]'),
-      transEl: card.querySelector('[data-trans]')
-    }};
-  }}
-
-  function broadcastCaption(text, emoji="") {{
-    localCap.innerText = text + (emoji ? " " + emoji : "");
-    apiSave(text, emoji);
-    Object.values(peers).forEach(p => {{
-      if (p.data && p.data.open) p.data.send({{ type:"caption", text, emoji }});
-    }});
-  }}
-
-  function handleIncomingData(fromPid, msg) {{
-    if (!msg || msg.type !== "caption") return;
-    const slot = ensureRemoteCard(fromPid);
-    const line = (msg.text || "") + (msg.emoji ? " " + msg.emoji : "");
-    slot.capEl.innerText = line;
-    (async () => {{
-      const ta = await translate(msg.text || "", "ta");
-      const hi = await translate(msg.text || "", "hi");
-      slot.transEl.innerHTML = 'TA: ' + ta + '<br/>HI: ' + hi;
-    }})();
-    speak(msg.text || "");
-  }}
-
-  // ---- PeerJS setup with TURN (reliable through NAT/firewalls) ----
-  async function initPeer() {{
-    return new Promise((resolve) => {{
-      const peerOpts = {{
-        host: "0.peerjs.com",
-        port: 443,
-        path: "/",
-        secure: true,
-        config: {{
-          iceServers: [
-            {{ urls: "stun:stun.l.google.com:19302" }},
-            {{ urls: "turn:openrelay.metered.ca:80",  username: "openrelayproject", credential: "openrelayproject" }},
-            {{ urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" }},
-            {{ urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }}
-          ]
-        }}
-      }};
-      peer = new Peer(undefined, peerOpts);
-
-      peer.on('open', (id) => {{
-        myPeerId = id;
-        setStatus("Peer ready (id: " + id + ") Room: " + ROOMCODE);
-
-        // Incoming media calls
-        peer.on('call', (incomingCall) => {{
-          if (localStream) incomingCall.answer(localStream);
-          incomingCall.on('stream', (remote) => {{
-            const pid = incomingCall.peer;
-            const slot = ensureRemoteCard(pid);
-            slot.videoEl.srcObject = remote;
-          }});
-          const pid = incomingCall.peer;
-          peers[pid] = Object.assign(peers[pid] || {{}}, {{ call: incomingCall }});
-        }});
-
-        // Incoming data connections
-        peer.on('connection', (conn) => {{
-          const pid = conn.peer;
-          peers[pid] = Object.assign(peers[pid] || {{}}, {{ data: conn }});
-          conn.on('data', (msg) => handleIncomingData(pid, msg));
-        }});
-
-        openSignaling();
-        joinRoomWS();
-        resolve(peer);
-      }});
-
-      peer.on('error', (err) => {{
-        console.error('PeerJS error:', err);
-        setStatus('Peer error: ' + (err && err.type ? err.type : 'unknown'));
-      }});
-    }});
-  }}
-
-  // ---- WS: room discovery ----
-  function joinRoomWS() {{
-    if (ws) try {{ ws.close(); }} catch (e) {{}}
-    ws = new WebSocket(wsRoomURL(ROOMCODE));
-    ws.onopen = () => {{
-      ws.send(JSON.stringify({{ type:"hello", peerId: myPeerId, userId: USER_ID }}));
-    }};
-    ws.onmessage = (ev) => {{
-      const m = JSON.parse(ev.data || '{{}}');
-      if (m.type === 'peers' && Array.isArray(m.peers)) {{
-        m.peers.forEach(pid => {{
-          if (!pid || pid === myPeerId) return;
-          if (peers[pid] && (peers[pid].call || peers[pid].data)) return;
-
-          // Outgoing media call
-          const outCall = peer.call(pid, localStream);
-          outCall.on('stream', (remote) => {{
-            const slot = ensureRemoteCard(pid);
-            slot.videoEl.srcObject = remote;
-          }});
-
-          // Outgoing data connection
-          const dconn = peer.connect(pid);
-          dconn.on('data', (msg) => handleIncomingData(pid, msg));
-
-          peers[pid] = Object.assign(peers[pid] || {{}}, {{ call: outCall, data: dconn }});
-        }});
-      }}
-    }};
-    ws.onclose = () => setStatus("Room socket closed (" + ROOMCODE + ")");
-  }}
-
-  // ---- WS: signaling/presence (ring/accept/reject) ----
-  function openSignaling() {{
-    if (sigWS) return;
-    sigWS = new WebSocket(wsSignalingURL());
-    sigWS.onopen = () => {{
-      sigWS.send(JSON.stringify({{ type:'presence_hello', userId: USER_ID }}));
-    }};
-    sigWS.onmessage = (ev) => {{
-      const m = JSON.parse(ev.data || '{{}}');
-      if (m.type === 'incoming_call') {{
-        const ok = window.confirm('Incoming call from ' + m.from + ' — join room ' + m.room + '?');
-        if (ok) {{
-          ROOMCODE = m.room;
-          sigWS.send(JSON.stringify({{
-            type:'call_accept', from: USER_ID, to: m.from, room: m.room
-          }}));
-          if (localStream) {{
-            joinRoomWS();
-          }} else {{
-            startCamera().then(() => joinRoomWS());
-          }}
-        }} else {{
-          sigWS.send(JSON.stringify({{
-            type:'call_reject', from: USER_ID, to: m.from, room: m.room
-          }}));
-        }}
-      }} else if (m.type === 'call_accepted') {{
-        ROOMCODE = m.room;
-        if (localStream) {{
-          joinRoomWS();
-        }} else {{
-          startCamera().then(() => joinRoomWS());
-        }}
-        setStatus("Call accepted. Joining " + ROOMCODE);
-      }} else if (m.type === 'call_rejected') {{
-        setStatus("Call rejected.");
-      }}
-    }};
-  }}
-
-  function callUser(targetUid) {{
-    if (!targetUid) {{
-      alert('Enter target user_id');
-      return;
-    }}
-    const room = 'sign-' + Math.random().toString(36).slice(2,8);
-    sigWS && sigWS.send(JSON.stringify({{
-      type:'ring', from: USER_ID, to: targetUid, room
-    }}));
-    setStatus("Ringing " + targetUid + " … (room " + room + ")");
-  }}
-
-  // ---- Buttons / helpers ----
-  async function startCamera() {{
-    localStream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: true }});
-    localVideo.srcObject = localStream;
-    if (!peer) await initPeer();
-    setStatus("Camera ON");
-  }}
-
-  document.getElementById('startCam').onclick = async () => {{
-    await startCamera();
-  }};
-
-  document.getElementById('stopCam').onclick = () => {{
-    Object.values(peers).forEach(p => {{
-      try {{ p.call && p.call.close(); }} catch(e){{}}
-      try {{ p.data && p.data.close(); }} catch(e){{}}
-    }});
-    if (localStream) {{
-      localStream.getTracks().forEach(t => t.stop());
-      localStream = null;
-      localVideo.srcObject = null;
-    }}
-    try {{ ws && ws.close(); }} catch(e){{}}
-    setStatus("Camera OFF");
-  }};
-
-  // ---- Web Speech (STT) ----
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let recog = null;
-  document.getElementById('startMic').onclick = () => {{
-    if (!SR) {{ setStatus("Web Speech not supported"); return; }}
-    recog = new SR();
-    recog.lang = "en-US";
-    recog.interimResults = true;
-    recog.continuous = true;
-    recog.onresult = (ev) => {{
-      for (let i=ev.resultIndex; i<ev.results.length; i++) {{
-        const res = ev.results[i];
-        const txt = res[0].transcript.trim();
-        if (txt && res.isFinal) broadcastCaption(txt, "");
-      }}
-    }};
-    recog.start();
-    setStatus("STT ON");
-  }};
-  document.getElementById('stopMic').onclick = () => {{
-    if (recog) try {{ recog.stop(); }} catch(e){{}}
-    setStatus("STT OFF");
-  }};
-
-  // ====== Custom gesture library ======
-  let GESTURE_LIB = [];
-  let WIN = [];
-  let customOn = false;
-  let cooldownUntil = 0;
 
   function renderGestureChips() {{
     customList.innerHTML = "";
@@ -571,12 +327,12 @@ with col1:
       const url = BACKEND + '/custom_gesture/samples?user_id=' + encodeURIComponent(USER_ID);
       const r = await fetch(url);
       if (!r.ok) throw new Error("fetch failed");
-      const rows = await r.json(); // each: {{name, seq_json}}
+      const rows = await r.json(); // {{name, seq_json}}
       const lib = [];
       for (const row of rows) {{
         const name = row.name || "custom";
         const seq = (row.seq_json && row.seq_json.frames) || [];
-        const frames = seq.map(fr => Float32Array.from(fr));
+        const frames = seq.map(fr => Float32Array.from(fr.flat ? fr.flat() : fr));
         const v = meanVec(frames);
         lib.push({{ name, vecs: [v] }});
       }}
@@ -595,8 +351,6 @@ with col1:
       renderGestureChips();
     }}
   }}
-
-  document.getElementById('refreshLib').onclick = () => loadGestureLibrary();
 
   // ---- Mediapipe Hands (quick + custom) ----
   let camera = null;
@@ -624,6 +378,32 @@ with col1:
     return out;
   }}
 
+  async function broadcastCaption(text, emoji="") {{
+    const line = text + (emoji ? " " + emoji : "");
+    localCap.innerText = line;
+    apiSave(text, emoji);
+
+    // translations
+    const lines = [];
+    for (const L of LANGS) {{
+      const t = await tr(text, L);
+      lines.push(L.toUpperCase() + ": " + t);
+    }}
+    localTrans.innerHTML = lines.join("<br/>");
+
+    // sign dictionary lookup
+    const info = await fetchSign(text);
+    if (info) {{
+      signInfo.innerHTML = "<b>" + info.name + "</b> " + (info.emoji||"") + "<br/>"
+        + (info.description || "") + "<br/>"
+        + (info.media ? '<img class="media" src="' + info.media + '"/>' : "");
+    }} else {{
+      signInfo.innerHTML = "";
+    }}
+
+    speak(text);
+  }}
+
   function tryCustomRecognition() {{
     if (!customOn) return;
     if (Date.now() < cooldownUntil) return;
@@ -646,7 +426,6 @@ with col1:
   hands.onResults((results) => {{
     if (!results.multiHandLandmarks || results.multiHandLandmarks.length===0) return;
 
-    // Quick hard-coded signs
     const lm = results.multiHandLandmarks[0];
     const isExt = (tip,pip)=> lm[tip].y < lm[pip].y;
     const isFold= (tip,pip)=> lm[tip].y > lm[pip].y;
@@ -664,7 +443,6 @@ with col1:
     if (thumbDown) {{ broadcastCaption("No", "👎"); return; }}
     if (vSign)     {{ broadcastCaption("Hello", "✌"); return; }}
 
-    // Sliding window for custom matching
     const pts = lm.map(p => [p.x, p.y, p.z]);
     const n = normalize(pts);
     const f63 = flatten63(n);
@@ -674,11 +452,32 @@ with col1:
     tryCustomRecognition();
   }});
 
+  // ---- Buttons / helpers ----
+  async function startCamera() {{
+    localStream = await navigator.mediaDevices.getUserMedia({{ video: true, audio: false }});
+    localVideo.srcObject = localStream;
+    setStatus("Camera ON");
+  }}
+
+  document.getElementById('startCam').onclick = async () => {{
+    await startCamera();
+  }};
+
+  document.getElementById('stopCam').onclick = () => {{
+    if (localStream) {{
+      localStream.getTracks().forEach(t => t.stop());
+      localStream = null;
+      localVideo.srcObject = null;
+    }}
+    setStatus("Camera OFF");
+  }};
+
   document.getElementById('startGest').onclick = async () => {{
     if (!localStream) {{ setStatus("Start camera first."); return; }}
     await loadGestureLibrary();
+    const videoGhost = document.createElement('video');
     videoGhost.srcObject = localStream;
-    videoGhost.play();
+    await videoGhost.play();
     camera = new window.Camera(videoGhost, {{
       onFrame: async () => {{ await hands.send({{ image: videoGhost }}); }},
       width: 320, height: 240
@@ -687,58 +486,25 @@ with col1:
     setStatus("Gestures ON");
   }};
   document.getElementById('stopGest').onclick = () => {{
-    if (camera) camera.stop();
+    try {{ camera.stop(); }} catch(_e) {{}}
     customOn = false;
     WIN = [];
     setStatus("Gestures OFF");
   }};
 
-  // ---- Invite link (avoid nullsrcdoc by using top/window) ----
-  function buildInviteLink() {{
-    let href = "";
-    try {{
-      href = (window.top && window.top.location && window.top.location.href) ||
-             (window.parent && window.parent.location && window.parent.location.href) ||
-             window.location.href;
-    }} catch (_e) {{
-      href = window.location.href;
-    }}
-    try {{
-      const u = new URL(href);
-      return u.origin + u.pathname + '?room=' + encodeURIComponent(ROOMCODE);
-    }} catch (_e) {{
-      return '?room=' + encodeURIComponent(ROOMCODE);
-    }}
-  }}
-
-  document.getElementById('callBtn').onclick = () => {{
-    const target = (document.getElementById('calleeUid').value || '').trim();
-    callUser(target);
-  }};
-  document.getElementById('copyLink').onclick = async () => {{
-    const link = buildInviteLink();
-    try {{
-      await navigator.clipboard.writeText(link);
-      setStatus('Invite link copied: ' + link);
-    }} catch (e) {{
-      setStatus('Copy failed. Link: ' + link);
-    }}
-  }};
   </script>
 </body>
 </html>
 """,
-        height=960,
+        height=680,
         scrolling=True,
     )
 
-# ===================== Teach a custom sign =====================
-with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=False):
+# ===================== TEACH NEW SIGN ===================
+with tab_teach:
     teach_name = st.text_input("Sign name (e.g., Amma, Bus stop, OK?)", key="teach_name")
     teach_reps = st.number_input("Samples to record", 5, 20, 8, key="teach_reps")
-    st.caption(
-        "Click Start teach then perform the sign; it will capture ~1.2s windows repeatedly until the target sample count is reached."
-    )
+    st.caption("Click Start teach and hold the sign steady ~1–2s; it captures ~36 frames per sample.")
 
     colA, colB = st.columns([1, 1])
     start_clicked = colA.button("Start teach", use_container_width=True)
@@ -890,22 +656,42 @@ with st.expander("🧪 Teach a custom sign (Personal Dictionary)", expanded=Fals
             height=380,
             scrolling=False,
         )
-    elif st.session_state.get("teach_on") is False:
-        st.info("Teaching stopped.")
+    else:
+        st.info("Teaching idle.")
 
-# ===================== COL2: CHAT =====================
-with col2:
+# ===================== SIGN DICTIONARY (embedded via API) ===========
+with tab_dict:
+    st.caption("Search the built-in sign library (backed by the /signs API).")
+    q = st.text_input("Search by name or keyword", "")
+    try:
+        r = requests.get(f"{BACKEND}/signs", params={"q": q}, timeout=10)
+        items = r.json() if r.ok else []
+    except Exception:
+        items = []
+
+    if not items:
+        st.info("No results.")
+    else:
+        cols = st.columns(3)
+        for i, s in enumerate(items):
+            with cols[i % 3]:
+                st.markdown(f"{s.get('name','')}** {s.get('emoji','')}")
+                if s.get("media"):
+                    st.image(s["media"], use_column_width=True)
+                st.caption(s.get("description",""))
+                if s.get("keywords"):
+                    st.write("Keywords:", ", ".join(s["keywords"]))
+
+# ===================== SIMPLE CHAT/HISTORY ==========================
+with tab_chat:
     st.subheader("Chat")
     msg = st.text_input("Type your message", placeholder="Say Hello / Yes / No …")
 
     send_col, load_col, clear_col = st.columns([1, 1, 1])
 
     def play_ui_sound(kind: str):
-        url = (
-            "https://cdn.jsdelivr.net/gh/napthedev/tones@main/click.mp3"
-            if kind == "send"
-            else "https://cdn.jsdelivr.net/gh/napthedev/tones@main/notify.mp3"
-        )
+        url = "https://cdn.jsdelivr.net/gh/napthedev/tones@main/click.mp3" if kind == "send" \
+              else "https://cdn.jsdelivr.net/gh/napthedev/tones@main/notify.mp3"
         st.components.v1.html(
             f'<audio autoplay style="display:none"><source src="{url}" type="audio/mpeg"></audio>',
             height=0,
@@ -928,6 +714,8 @@ with col2:
                 st.success("Message sent!")
                 if play_ui_sounds:
                     play_ui_sound("send")
+            else:
+                st.error(f"Backend error: {res.text}")
         except Exception as e:
             st.error(f"Failed: {e}")
 
@@ -945,75 +733,73 @@ with col2:
     st.markdown("### History")
     history_box = st.container()
 
-# ===================== HELPERS ========================
-def fetch_history(uid: str):
-    try:
-        r = requests.get(f"{BACKEND}/history/{uid}", timeout=10)
-        return r.json() if r.ok else []
-    except Exception:
-        return []
-
-def translate_line(text: str, lang: str):
-    try:
-        r = requests.get(f"{BACKEND}/translate", params={"text": text, "lang": lang}, timeout=10)
-        if r.ok:
-            return r.json().get("translated", "")
-    except Exception:
-        pass
-    return ""
-
-def render_messages(items):
-    if not items:
-        st.info("No messages yet. Start by sending one.")
-        return
-    items = sorted(items, key=lambda x: x.get("timestamp", ""))
-    for row in items:
-        content = (row.get("content") or "").strip()
-        emoji = row.get("emoji", "")
-        ts = row.get("timestamp", "")
+    # ===== HELPERS =====
+    def fetch_history(uid: str):
         try:
-            pretty_ts = datetime.fromisoformat(ts.replace("Z", "")).strftime("%d %b %Y • %I:%M %p")
+            r = requests.get(f"{BACKEND}/history/{uid}", timeout=10)
+            return r.json() if r.ok else []
         except Exception:
-            pretty_ts = ts
+            return []
 
-        st.markdown(
-            f"""
-            <div class="msg-card msg-you">
-              <div><strong>You</strong> <span class="pill">en</span></div>
-              <div style="margin-top:6px">{content} <span class="msg-emoji">{emoji}</span></div>
-              <div class="msg-meta">{pretty_ts}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    def translate_line(text: str, lang: str):
+        try:
+            r = requests.get(f"{BACKEND}/translate", params={"text": text, "lang": lang}, timeout=10)
+            if r.ok:
+                return r.json().get("translated", "")
+        except Exception:
+            pass
+        return ""
 
-        if translate_toggle and content:
-            ta = translate_line(content, "ta")
-            hi = translate_line(content, "hi")
-            if ta or hi:
+    def render_messages(items):
+        if not items:
+            st.info("No messages yet. Start by sending one.")
+            return
+        items.sort(key=lambda x: x.get("timestamp",""))
+        for row in items:
+            content = (row.get("content") or "").strip()
+            emoji = row.get("emoji", "")
+            ts = row.get("timestamp", "")
+            try:
+                pretty_ts = datetime.fromisoformat(ts.replace("Z", "")).strftime("%d %b %Y • %I:%M %p")
+            except Exception:
+                pretty_ts = ts
+
+            st.markdown(
+                f"""
+                <div class="msg-card msg-you">
+                  <div><strong>You</strong> <span class="pill">en</span></div>
+                  <div style="margin-top:6px">{content} <span class="msg-emoji">{emoji}</span></div>
+                  <div class="msg-meta">{pretty_ts}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if content:
+                trans_lines = []
+                for L in selected_langs:
+                    t = translate_line(content, L)
+                    trans_lines.append(f"{L.upper()}: {t}")
                 st.markdown(
-                    f"""<div class="msg-translate">
-                    <div>TA: {ta}</div>
-                    <div>HI: {hi}</div>
-                    </div>""",
+                    f"""<div class="msg-translate">{'<br/>'.join(trans_lines)}</div>""",
                     unsafe_allow_html=True,
                 )
 
-items = fetch_history(st.session_state["user_id"])
-with history_box:
-    render_messages(items)
+    items = fetch_history(st.session_state["user_id"])
+    with history_box:
+        render_messages(items)
 
-if items:
-    newest_ts = max(x.get("timestamp", "") for x in items)
-    if newest_ts and newest_ts != st.session_state["last_seen_ts"]:
-        if st.session_state["last_seen_ts"] and play_ui_sounds:
-            play_ui_sound("recv")
-        st.session_state["last_seen_ts"] = newest_ts
+    if items:
+        newest_ts = max(x.get("timestamp", "") for x in items)
+        if newest_ts and newest_ts != st.session_state["last_seen_ts"]:
+            if st.session_state["last_seen_ts"] and play_ui_sounds:
+                play_ui_sound("recv")
+            st.session_state["last_seen_ts"] = newest_ts
 
-if st.session_state.get("_force_reload"):
-    st.session_state["_force_reload"] = False
-    st.rerun()
+    if st.session_state.get("_force_reload"):
+        st.session_state["_force_reload"] = False
+        st.rerun()
 
-if autorefresh:
-    time.sleep(2)
-    st.rerun()
+    if autorefresh:
+        time.sleep(2)
+        st.rerun()

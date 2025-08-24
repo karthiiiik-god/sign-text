@@ -1,50 +1,70 @@
 # main.py
-import json
+import hashlib
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="SignCall Backend")
+# -----------------------------------------------------------------------------
+# App + CORS
+# -----------------------------------------------------------------------------
+app = FastAPI(title="SignCall Backend (No-Call Mode)")
 
-# --- CORS (allow everything for dev; tighten in prod) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],   # FIX: must be "*", not ""
-    allow_headers=["*"],   # FIX: must be "*", not ""
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ===== In-memory stores (OK for demos; swap to DB in prod) =====
-MESSAGES: Dict[str, List[dict]] = defaultdict(list)              # user_id -> [{content, emoji, timestamp}]
-CUSTOM_GESTURES: Dict[str, List[dict]] = defaultdict(list)       # user_id -> [{name, seq_json}]
-SIGNALING: Dict[str, Set[WebSocket]] = defaultdict(set)          # user_id -> websockets
+# -----------------------------------------------------------------------------
+# In-memory stores  (OK for demos; swap for a DB in production)
+# -----------------------------------------------------------------------------
+USERS: Dict[str, str] = {}  # email -> pw_hash
+MESSAGES: Dict[str, List[dict]] = defaultdict(list)         # user_id -> [{content, emoji, language, timestamp}]
+CUSTOM_GESTURES: Dict[str, List[dict]] = defaultdict(list)  # user_id -> [{name, seq_json}]
+SOS_LOG: List[dict] = []                                    # recent SOS pings
 
-# WebRTC signaling room: room -> {clientId: websocket}
-ROOM_SOCKS: Dict[str, Dict[str, WebSocket]] = defaultdict(dict)
-# Reverse map: websocket -> (room, clientId)
-WS_META: Dict[WebSocket, Dict[str, str]] = {}
+SALT = "signcall_demo_salt_v1"
 
-# ===== Helpers =====
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-# ===== Auth (demo) =====
-@app.post("/login")
-async def login(email: str = Query(...), password: str = Query(...)):
-    # Demo auth: treat the email as user_id
-    return {"user_id": email}
 
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256((SALT + pw).encode("utf-8")).hexdigest()
+
+
+# -----------------------------------------------------------------------------
+# Auth (email == user_id for demo)
+# -----------------------------------------------------------------------------
 @app.post("/signup")
 async def signup(email: str = Query(...), password: str = Query(...)):
-    # Demo signup: no storage, just echo an id
-    return {"user_id": email}
+    if not email or not password or len(password) < 6:
+        return JSONResponse({"ok": False, "error": "Invalid email or password too short"}, status_code=400)
+    if email in USERS:
+        return JSONResponse({"ok": False, "error": "User already exists"}, status_code=409)
+    USERS[email] = hash_pw(password)
+    return {"ok": True, "user_id": email}
 
-# ===== Chat & history =====
+
+@app.post("/login")
+async def login(email: str = Query(...), password: str = Query(...)):
+    if email not in USERS:
+        return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
+    if USERS[email] != hash_pw(password):
+        return JSONResponse({"ok": False, "error": "Invalid credentials"}, status_code=401)
+    return {"ok": True, "user_id": email}
+
+
+# -----------------------------------------------------------------------------
+# Chat & history
+# -----------------------------------------------------------------------------
 @app.post("/message")
 async def post_message(
     user_id: str = Query(...),
@@ -52,166 +72,84 @@ async def post_message(
     emoji: str = Query(""),
     language: str = Query("en"),
 ):
-    MESSAGES[user_id].append({
-        "content": content, "emoji": emoji,
-        "language": language, "timestamp": now_iso(),
-    })
+    MESSAGES[user_id].append(
+        {
+            "content": content,
+            "emoji": emoji,
+            "language": language,
+            "timestamp": now_iso(),
+        }
+    )
     return {"ok": True}
+
 
 @app.get("/history/{user_id}")
 async def get_history(user_id: str):
     return JSONResponse(MESSAGES.get(user_id, []))
+
 
 @app.delete("/history/{user_id}")
 async def clear_history(user_id: str):
     MESSAGES[user_id].clear()
     return {"ok": True}
 
-# ===== Translation (demo stub) =====
+
+# -----------------------------------------------------------------------------
+# Translation (stub) – replace with a real service if you want
+# -----------------------------------------------------------------------------
 @app.get("/translate")
 async def translate(text: str = Query(""), lang: str = Query("en")):
-    # Stub: just echo text; plug real translator here (e.g., gcloud/LibreTranslate)
+    # Demo: echo the same text back (so the UI flow works).
+    # Swap with a real translator (LibreTranslate/GCloud/Azure) later.
     return {"translated": text}
 
-# ===== Custom gesture endpoints =====
+
+# -----------------------------------------------------------------------------
+# Custom gesture endpoints
+# -----------------------------------------------------------------------------
 @app.get("/custom_gesture/samples")
 async def list_gesture_samples(user_id: str = Query(...)):
     return JSONResponse(CUSTOM_GESTURES.get(user_id, []))
+
 
 @app.post("/custom_gesture/save")
 async def save_gesture_sample(
     user_id: str = Query(...),
     name: str = Query(...),
     sample_idx: int = Query(0),
-    body: dict = None,
+    body: dict = Body(...),  # expects {"frames": [[63 floats per frame] * 36]}
 ):
-    if not isinstance(body, dict):
+    if not isinstance(body, dict) or "frames" not in body:
         return JSONResponse({"ok": False, "error": "Invalid body"}, status_code=400)
     CUSTOM_GESTURES[user_id].append({"name": name, "seq_json": body})
     return {"ok": True, "count": len(CUSTOM_GESTURES[user_id])}
 
-# ===== WebSocket: user presence signaling (rings & accept/reject) =====
-@app.websocket("/ws/signaling")
-async def ws_signaling(ws: WebSocket):
-    await ws.accept()
-    user_id = None
-    try:
-        while True:
-            data = await ws.receive_text()
-            msg = json.loads(data)
 
-            # Initial hello
-            if msg.get("type") == "presence_hello":
-                user_id = msg.get("userId") or "anon"
-                SIGNALING[user_id].add(ws)
-                continue
+# -----------------------------------------------------------------------------
+# SOS (for Voice Assistant)
+# -----------------------------------------------------------------------------
+@app.post("/sos")
+async def sos(
+    user_id: str = Query(...),
+    note: str = Query(""),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+):
+    item = {
+        "user_id": user_id,
+        "note": note,
+        "lat": lat,
+        "lon": lon,
+        "timestamp": now_iso(),
+    }
+    SOS_LOG.append(item)
+    # In production: trigger SMS/Whatsapp/webhook here.
+    return {"ok": True, "saved": item}
 
-            # Caller -> ring
-            if msg.get("type") == "ring":
-                to = msg.get("to")
-                payload = {"type": "incoming_call", "from": msg.get("from"), "room": msg.get("room")}
-                for peer_ws in list(SIGNALING.get(to, set())):
-                    try:
-                        await peer_ws.send_text(json.dumps(payload))
-                    except Exception:
-                        SIGNALING[to].discard(peer_ws)
-                continue
 
-            # Callee -> accept / reject
-            if msg.get("type") in ("call_accept", "call_reject"):
-                to = msg.get("to")  # original caller
-                event = "call_accepted" if msg["type"] == "call_accept" else "call_rejected"
-                payload = {"type": event, "from": msg.get("from"), "room": msg.get("room")}
-                for peer_ws in list(SIGNALING.get(to, set())):
-                    try:
-                        await peer_ws.send_text(json.dumps(payload))
-                    except Exception:
-                        SIGNALING[to].discard(peer_ws)
-                continue
-    except WebSocketDisconnect:
-        pass
-    finally:
-        # clean up
-        if user_id and ws in SIGNALING.get(user_id, set()):
-            SIGNALING[user_id].discard(ws)
-
-# ===== WebSocket: WebRTC room signaling (native WebRTC, no PeerJS) =====
-@app.websocket("/ws/room/{room_code}")
-async def ws_room(ws: WebSocket, room_code: str):
-    await ws.accept()
-    client_id = None
-    try:
-        # Expect first message: {"type":"hello", "clientId": "...", "userId": "..."}
-        hello_raw = await ws.receive_text()
-        hello = json.loads(hello_raw)
-        assert hello.get("type") == "hello" and hello.get("clientId")
-        client_id = str(hello["clientId"])
-
-        # Register
-        ROOM_SOCKS[room_code][client_id] = ws
-        WS_META[ws] = {"room": room_code, "clientId": client_id}
-
-        # Send roster (others)
-        others = [cid for cid in ROOM_SOCKS[room_code].keys() if cid != client_id]
-        await ws.send_text(json.dumps({"type": "roster", "peers": others}))
-
-        # Notify others that a new peer joined (optional)
-        join_msg = json.dumps({"type": "peer_joined", "clientId": client_id})
-        for cid, peer_ws in list(ROOM_SOCKS[room_code].items()):
-            if cid == client_id:
-                continue
-            try:
-                await peer_ws.send_text(join_msg)
-            except Exception:
-                # drop dead sockets
-                ROOM_SOCKS[room_code].pop(cid, None)
-
-        # Relay loop
-        while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-
-            # Relay WebRTC signals: {type:"signal", to:"clientId", from:"clientId", data:{...}}
-            if msg.get("type") == "signal" and msg.get("to"):
-                to_id = str(msg.get("to"))
-                target = ROOM_SOCKS[room_code].get(to_id)
-                if target:
-                    try:
-                        await target.send_text(json.dumps({
-                            "type": "signal",
-                            "from": client_id,
-                            "data": msg.get("data", {}),
-                        }))
-                    except Exception:
-                        ROOM_SOCKS[room_code].pop(to_id, None)
-                continue
-
-            # Optional pings
-            if msg.get("type") == "ping":
-                await ws.send_text(json.dumps({"type": "pong"}))
-                continue
-
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        # Bad hello or parse error
-        try:
-            await ws.close(code=4000)
-        except Exception:
-            pass
-    finally:
-        meta = WS_META.pop(ws, None)
-        if meta:
-            room = meta["room"]
-            cid = meta["clientId"]
-            if room in ROOM_SOCKS and cid in ROOM_SOCKS[room]:
-                ROOM_SOCKS[room].pop(cid, None)
-                # Notify remaining peers
-                left_msg = json.dumps({"type": "peer_left", "clientId": cid})
-                for pid, pws in list(ROOM_SOCKS[room].items()):
-                    try:
-                        await pws.send_text(left_msg)
-                    except Exception:
-                        ROOM_SOCKS[room].pop(pid, None)
-            if room in ROOM_SOCKS and not ROOM_SOCKS[room]:
-                ROOM_SOCKS.pop(room, None)
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {"ok": True, "time": now_iso()}
